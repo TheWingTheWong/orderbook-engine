@@ -9,6 +9,7 @@
 //! * [`book`] — the [`OrderBook`] and its matching logic.
 //! * [`depth`] — top of book and L2 depth snapshots.
 //! * [`invariants`] — structural book checks and quantity-conservation ledger.
+//! * [`reference`] — naive O(n) book used as a differential-testing oracle.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms)]
@@ -17,6 +18,7 @@ pub mod book;
 pub mod depth;
 pub mod invariants;
 pub mod level;
+pub mod reference;
 pub mod slab;
 pub mod types;
 
