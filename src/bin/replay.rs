@@ -182,11 +182,32 @@ fn timer_characteristics() -> (u64, u64) {
     (resolution, h.percentile(50.0))
 }
 
-fn latency_pass(args: &Args) -> Histogram {
+/// Latency histograms: all commands, then broken down by what the command
+/// did to the book.
+struct Latencies {
+    all: Histogram,
+    /// New orders that only rested (no trade).
+    add: Histogram,
+    /// New orders or re-prices that traded at least once.
+    take: Histogram,
+    /// Cancels.
+    cancel: Histogram,
+    /// Modifies that did not trade.
+    modify: Histogram,
+}
+
+fn latency_pass(args: &Args) -> Latencies {
     let mut gen = flow(args);
     let mut book = OrderBook::with_capacity(args.live_window * 2);
-    let mut sink = Feedback::default();
-    let mut hist = Histogram::new();
+    let mut feedback = Feedback::default();
+    let mut counts = CountingSink::default();
+    let mut lat = Latencies {
+        all: Histogram::new(),
+        add: Histogram::new(),
+        take: Histogram::new(),
+        cancel: Histogram::new(),
+        modify: Histogram::new(),
+    };
     let mut chunk: Vec<Command> = Vec::with_capacity(CHUNK);
     let mut done = 0u64;
     while done < args.orders {
@@ -194,15 +215,24 @@ fn latency_pass(args: &Args) -> Histogram {
         chunk.clear();
         chunk.extend(gen.by_ref().take(n));
         for &cmd in &chunk {
+            let trades_before = counts.trades;
             let t0 = Instant::now();
-            book.process(cmd, &mut sink);
-            hist.record(t0.elapsed().as_nanos() as u64);
+            book.process(cmd, &mut Tee(&mut feedback, &mut counts));
+            let ns = t0.elapsed().as_nanos() as u64;
+            lat.all.record(ns);
+            let bucket = match cmd {
+                _ if counts.trades != trades_before => &mut lat.take,
+                Command::New(_) => &mut lat.add,
+                Command::Cancel { .. } => &mut lat.cancel,
+                Command::Modify { .. } => &mut lat.modify,
+            };
+            bucket.record(ns);
         }
-        sink.drain_into(&mut gen);
+        feedback.drain_into(&mut gen);
         done += n as u64;
     }
     std::hint::black_box(&book);
-    hist
+    lat
 }
 
 fn fmt_int(n: u64) -> String {
@@ -275,18 +305,34 @@ fn main() -> ExitCode {
 
     if !args.skip_latency {
         let (res, overhead) = timer_characteristics();
-        let h = latency_pass(&args);
+        let lat = latency_pass(&args);
         println!();
-        println!("latency per command (ns, includes clock read)");
-        println!("  timer resolution   {:>14}", res);
-        println!("  timer overhead p50 {:>14}", overhead);
-        for (label, p) in
-            [("p50", 50.0), ("p90", 90.0), ("p99", 99.0), ("p99.9", 99.9), ("p99.99", 99.99)]
-        {
-            println!("  {label:<18} {:>14}", fmt_int(h.percentile(p)));
+        println!("latency per command (ns, includes one clock read)");
+        println!("  timer resolution {res} ns, back-to-back clock read p50 {overhead} ns");
+        println!();
+        println!(
+            "  {:<12} {:>12} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10}",
+            "", "count", "p50", "p90", "p99", "p99.9", "p99.99", "max"
+        );
+        for (label, h) in [
+            ("all", &lat.all),
+            ("add (rest)", &lat.add),
+            ("take", &lat.take),
+            ("cancel", &lat.cancel),
+            ("modify", &lat.modify),
+        ] {
+            println!(
+                "  {label:<12} {:>12} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10}",
+                fmt_int(h.len()),
+                fmt_int(h.percentile(50.0)),
+                fmt_int(h.percentile(90.0)),
+                fmt_int(h.percentile(99.0)),
+                fmt_int(h.percentile(99.9)),
+                fmt_int(h.percentile(99.99)),
+                fmt_int(h.max()),
+            );
         }
-        println!("  mean               {:>14.1}", h.mean());
-        println!("  max                {:>14}", fmt_int(h.max()));
+        println!("  mean (all)   {:>12.1}", lat.all.mean());
     }
     ExitCode::SUCCESS
 }
