@@ -1,0 +1,22 @@
+[package]
+name = "orderbook-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+authors = ["Ansorjon Juraev"]
+description = "A high-performance price-time priority limit order book and matching engine"
+license = "MIT"
+readme = "README.md"
+keywords = ["orderbook", "matching-engine", "trading", "exchange", "lob"]
+categories = ["finance", "data-structures"]
+
+[dependencies]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.bench]
+inherits = "release"
