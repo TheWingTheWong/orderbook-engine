@@ -5,6 +5,7 @@
 //!
 //! * [`types`] — prices, quantities, order requests, commands and events.
 //! * [`slab`] — free-list object pool backing resting orders.
+//! * [`hash`] — Fx-style hasher for the integer order-id index.
 //! * [`level`] — intrusive FIFO queue of orders at one price.
 //! * [`book`] — the [`OrderBook`] and its matching logic.
 //! * [`depth`] — top of book and L2 depth snapshots.
@@ -19,6 +20,7 @@
 pub mod book;
 pub mod depth;
 pub mod gen;
+pub mod hash;
 pub mod invariants;
 pub mod level;
 pub mod reference;

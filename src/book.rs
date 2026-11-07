@@ -11,7 +11,7 @@
 //!               │ head                tail │
 //!               ▼                          ▼
 //!   orders: Slab<OrderNode>  [ n0 ⇄ n1 ⇄ n2 ⇄ ... ]   (intrusive prev/next)
-//!   index:  HashMap<OrderId, SlotId>  → O(1) lookup for cancel / modify
+//!   index:  FxHashMap<OrderId, SlotId> → O(1) lookup for cancel / modify
 //! ```
 //!
 //! Matching walks the opposite side from the best price inward, consuming each
@@ -19,8 +19,9 @@
 //! (maker) order's price.
 
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
+use crate::hash::FxHashMap;
 use crate::level::{Level, OrderNode};
 use crate::slab::{Slab, SlotId, NIL};
 use crate::types::*;
@@ -44,7 +45,7 @@ pub struct OrderBook {
     pub(crate) bids: BTreeMap<Price, Level>,
     pub(crate) asks: BTreeMap<Price, Level>,
     pub(crate) orders: Slab<OrderNode>,
-    pub(crate) index: HashMap<OrderId, SlotId>,
+    pub(crate) index: FxHashMap<OrderId, SlotId>,
 }
 
 impl OrderBook {
@@ -59,7 +60,7 @@ impl OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             orders: Slab::with_capacity(resting_orders),
-            index: HashMap::with_capacity(resting_orders),
+            index: FxHashMap::with_capacity_and_hasher(resting_orders, Default::default()),
         }
     }
 
