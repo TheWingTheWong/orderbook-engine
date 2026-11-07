@@ -3,16 +3,21 @@
 //! ## Layout
 //!
 //! ```text
-//!   bids: BTreeMap<Price, Level>      asks: BTreeMap<Price, Level>
-//!          best = last key                   best = first key
-//!               │                                  │
-//!               ▼                                  ▼
-//!         Level{head,tail,total,count}  ...
-//!               │ head                tail │
-//!               ▼                          ▼
-//!   orders: Slab<OrderNode>  [ n0 ⇄ n1 ⇄ n2 ⇄ ... ]   (intrusive prev/next)
+//!   bids: BTreeMap<Price, LevelId>     asks: BTreeMap<Price, LevelId>
+//!          best = last key                    best = first key
+//!               │                                   │
+//!               ▼                                   ▼
+//!   levels: Slab<Level>   Level{head, tail, total_qty, count}
+//!               │ head                 tail │
+//!               ▼                           ▼
+//!   orders: Slab<OrderNode>  [ n0 ⇄ n1 ⇄ n2 ⇄ ... ]   (intrusive prev/next,
+//!                                                     each node knows its level)
 //!   index:  FxHashMap<OrderId, SlotId> → O(1) lookup for cancel / modify
 //! ```
+//!
+//! The B-trees only map prices to level slots. Cancel goes id → node → level
+//! through the index and the node's back-reference, unlinks in O(1), and only
+//! touches the tree if the level became empty.
 //!
 //! Matching walks the opposite side from the best price inward, consuming each
 //! level's FIFO queue from the head. Executions always occur at the resting
@@ -42,8 +47,9 @@ pub struct RestingOrder {
 /// A single-instrument limit order book with price-time priority matching.
 #[derive(Debug, Clone, Default)]
 pub struct OrderBook {
-    pub(crate) bids: BTreeMap<Price, Level>,
-    pub(crate) asks: BTreeMap<Price, Level>,
+    pub(crate) bids: BTreeMap<Price, SlotId>,
+    pub(crate) asks: BTreeMap<Price, SlotId>,
+    pub(crate) levels: Slab<Level>,
     pub(crate) orders: Slab<OrderNode>,
     pub(crate) index: FxHashMap<OrderId, SlotId>,
 }
@@ -59,6 +65,7 @@ impl OrderBook {
         Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
+            levels: Slab::new(),
             orders: Slab::with_capacity(resting_orders),
             index: FxHashMap::with_capacity_and_hasher(resting_orders, Default::default()),
         }
@@ -194,8 +201,7 @@ impl OrderBook {
         let node = self.orders[idx];
 
         if price == node.price && qty <= node.qty {
-            let level = self.side_mut(node.side).get_mut(&node.price).expect("level of live order");
-            level.total_qty -= node.qty - qty;
+            self.levels[node.level].total_qty -= node.qty - qty;
             self.orders[idx].qty = qty;
             return sink.on_event(Event::Modified {
                 id,
@@ -228,7 +234,7 @@ impl OrderBook {
     }
 
     #[inline]
-    fn side_mut(&mut self, side: Side) -> &mut BTreeMap<Price, Level> {
+    fn side_mut(&mut self, side: Side) -> &mut BTreeMap<Price, SlotId> {
         match side {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
@@ -238,19 +244,12 @@ impl OrderBook {
     /// Detach the order in slot `idx` from its level, drop the level if it
     /// became empty, and free the slot. The caller owns the index entry.
     fn unlink_resting(&mut self, idx: SlotId) -> OrderNode {
-        let OrderNode { side, price, .. } = self.orders[idx];
-        let book = match side {
-            Side::Buy => &mut self.bids,
-            Side::Sell => &mut self.asks,
-        };
-        if let Entry::Occupied(mut e) = book.entry(price) {
-            let level = e.get_mut();
-            level.unlink(&mut self.orders, idx);
-            if level.is_empty() {
-                e.remove();
-            }
-        } else {
-            unreachable!("resting order {} has no level at {price}", self.orders[idx].id);
+        let OrderNode { side, price, level: lid, .. } = self.orders[idx];
+        let level = &mut self.levels[lid];
+        level.unlink(&mut self.orders, idx);
+        if level.is_empty() {
+            self.levels.remove(lid);
+            self.side_mut(side).remove(&price);
         }
         self.orders.remove(idx)
     }
@@ -268,8 +267,8 @@ impl OrderBook {
     /// `side` is willing to trade at. Touches only as many levels as needed.
     fn can_fill(&self, side: Side, limit: Price, qty: Qty) -> bool {
         let mut need = qty;
-        let mut take = |level: &Level| {
-            need = need.saturating_sub(level.total_qty);
+        let mut take = |&lid: &SlotId| {
+            need = need.saturating_sub(self.levels[lid].total_qty);
             need == 0
         };
         match side {
@@ -297,12 +296,13 @@ impl OrderBook {
                 Side::Buy => book.first_entry(),
                 Side::Sell => book.last_entry(),
             };
-            let Some(mut entry) = best else { break };
+            let Some(entry) = best else { break };
             let price = *entry.key();
             if !side.crosses(limit, price) {
                 break;
             }
-            let level = entry.get_mut();
+            let lid = *entry.get();
+            let level = &mut self.levels[lid];
             while remaining > 0 && level.head != NIL {
                 let idx = level.head;
                 let maker = &mut self.orders[idx];
@@ -328,6 +328,7 @@ impl OrderBook {
             }
             if level.is_empty() {
                 entry.remove();
+                self.levels.remove(lid);
             }
         }
         remaining
@@ -343,18 +344,26 @@ impl OrderBook {
         post_only: bool,
         sink: &mut S,
     ) {
-        let idx =
-            self.orders.insert(OrderNode { id, side, price, qty, post_only, prev: NIL, next: NIL });
-        self.index.insert(id, idx);
         let book = match side {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
         };
-        let level = match book.entry(price) {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(Level::new()),
+        let lid = match book.entry(price) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => *e.insert(self.levels.insert(Level::new())),
         };
-        level.push_back(&mut self.orders, idx);
+        let idx = self.orders.insert(OrderNode {
+            id,
+            side,
+            price,
+            qty,
+            post_only,
+            level: lid,
+            prev: NIL,
+            next: NIL,
+        });
+        self.index.insert(id, idx);
+        self.levels[lid].push_back(&mut self.orders, idx);
         sink.on_event(Event::Booked { id, side, price, qty });
     }
 }
@@ -423,7 +432,7 @@ mod tests {
                 Event::Rejected { id: 1, reason: RejectReason::UnknownOrder },
             ]
         );
-        assert!(b.is_empty() && b.bids.is_empty());
+        assert!(b.is_empty() && b.bids.is_empty() && b.levels.is_empty());
     }
 
     #[test]

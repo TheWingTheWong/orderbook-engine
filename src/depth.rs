@@ -2,6 +2,7 @@
 
 use crate::book::OrderBook;
 use crate::level::Level;
+use crate::slab::SlotId;
 use crate::types::{Price, Qty, Side};
 
 /// Aggregate of one price level.
@@ -51,8 +52,8 @@ impl OrderBook {
     /// Best bid and ask with their aggregate size.
     pub fn top_of_book(&self) -> TopOfBook {
         TopOfBook {
-            bid: self.bids.iter().next_back().map(|(&p, l)| LevelSummary::new(p, l)),
-            ask: self.asks.iter().next().map(|(&p, l)| LevelSummary::new(p, l)),
+            bid: self.bids.iter().next_back().map(|(&p, &l)| LevelSummary::new(p, &self.levels[l])),
+            ask: self.asks.iter().next().map(|(&p, &l)| LevelSummary::new(p, &self.levels[l])),
         }
     }
 
@@ -68,8 +69,9 @@ impl OrderBook {
     pub fn depth_into(&self, levels: usize, out: &mut Depth) {
         out.bids.clear();
         out.asks.clear();
-        out.bids.extend(self.bids.iter().rev().take(levels).map(|(&p, l)| LevelSummary::new(p, l)));
-        out.asks.extend(self.asks.iter().take(levels).map(|(&p, l)| LevelSummary::new(p, l)));
+        let summary = |(&p, &l): (&Price, &SlotId)| LevelSummary::new(p, &self.levels[l]);
+        out.bids.extend(self.bids.iter().rev().take(levels).map(summary));
+        out.asks.extend(self.asks.iter().take(levels).map(summary));
     }
 
     /// Open quantity resting at exactly `price` on `side`.
@@ -78,7 +80,7 @@ impl OrderBook {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
         };
-        book.get(&price).map_or(0, |l| l.total_qty)
+        book.get(&price).map_or(0, |&l| self.levels[l].total_qty)
     }
 
     /// Number of distinct price levels on `side`.
@@ -95,7 +97,7 @@ impl OrderBook {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
         };
-        book.values().map(|l| l.total_qty).sum()
+        book.values().map(|&l| self.levels[l].total_qty).sum()
     }
 }
 

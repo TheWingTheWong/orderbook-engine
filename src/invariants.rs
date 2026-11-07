@@ -20,7 +20,7 @@ use std::fmt;
 
 use crate::book::OrderBook;
 use crate::level::Level;
-use crate::slab::NIL;
+use crate::slab::{SlotId, NIL};
 use crate::types::{Event, EventSink, Price, Qty, Side};
 
 /// A broken invariant, with a human-readable explanation.
@@ -51,11 +51,20 @@ pub fn check_book(book: &OrderBook) -> Result<(), Violation> {
     }
 
     let mut seen = 0usize;
-    for (side, levels) in [(Side::Buy, &book.bids), (Side::Sell, &book.asks)] {
-        for (&price, level) in levels {
-            seen += check_level(book, side, price, level)?;
+    for (side, tree) in [(Side::Buy, &book.bids), (Side::Sell, &book.asks)] {
+        for (&price, &lid) in tree {
+            let Some(level) = book.levels.get(lid) else {
+                return Err(Violation(format!("{side} {price} maps to freed level slot {lid}")));
+            };
+            seen += check_level(book, side, price, lid, level)?;
         }
     }
+    let tree_levels = book.bids.len() + book.asks.len();
+    ensure!(
+        book.levels.len() == tree_levels,
+        "level slab holds {} levels, trees reference {tree_levels}",
+        book.levels.len()
+    );
 
     ensure!(
         seen == book.orders.len(),
@@ -79,6 +88,7 @@ fn check_level(
     book: &OrderBook,
     side: Side,
     price: Price,
+    lid: SlotId,
     level: &Level,
 ) -> Result<usize, Violation> {
     ensure!(!level.is_empty(), "{side} level {price} is empty but still in the tree");
@@ -92,6 +102,12 @@ fn check_level(
         ensure!(node.side == side, "order {} on wrong side", node.id);
         ensure!(node.price == price, "order {} priced {} queued at {price}", node.id, node.price);
         ensure!(node.qty > 0, "order {} rests with zero quantity", node.id);
+        ensure!(
+            node.level == lid,
+            "order {} points at level slot {} not {lid}",
+            node.id,
+            node.level
+        );
         ensure!(book.index.get(&node.id) == Some(&slot), "order {} missing from index", node.id);
         count += 1;
         total += node.qty;
@@ -179,7 +195,8 @@ mod tests {
     fn detects_corrupted_level_total() {
         let mut b = OrderBook::new();
         b.submit(NewOrder::limit(1, Side::Buy, 100, 10), &mut crate::NullSink);
-        b.bids.get_mut(&100).unwrap().total_qty = 11;
+        let lid = b.bids[&100];
+        b.levels[lid].total_qty = 11;
         let err = check_book(&b).unwrap_err();
         assert!(err.0.contains("total_qty"), "{err}");
     }

@@ -21,6 +21,9 @@ pub struct OrderNode {
     pub qty: Qty,
     /// Whether the order was entered post-only (respected on re-pricing).
     pub post_only: bool,
+    /// Slot of the [`Level`] this order is queued in, so cancel can reach
+    /// its level without a price lookup.
+    pub level: SlotId,
     /// Previous (older) order at this level, or [`NIL`].
     pub prev: SlotId,
     /// Next (younger) order at this level, or [`NIL`].
@@ -126,7 +129,16 @@ mod tests {
     use super::*;
 
     fn node(id: OrderId, qty: Qty) -> OrderNode {
-        OrderNode { id, side: Side::Buy, price: 100, qty, post_only: false, prev: NIL, next: NIL }
+        OrderNode {
+            id,
+            side: Side::Buy,
+            price: 100,
+            qty,
+            post_only: false,
+            level: 0,
+            prev: NIL,
+            next: NIL,
+        }
     }
 
     fn ids(level: &Level, slab: &Slab<OrderNode>) -> Vec<OrderId> {
