@@ -322,6 +322,18 @@ impl EventSink for CountingSink {
     }
 }
 
+/// Sink that forwards every event to two sinks, in order.
+#[derive(Debug, Default, Clone)]
+pub struct Tee<A, B>(pub A, pub B);
+
+impl<A: EventSink, B: EventSink> EventSink for Tee<A, B> {
+    #[inline]
+    fn on_event(&mut self, event: Event) {
+        self.0.on_event(event);
+        self.1.on_event(event);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
