@@ -14,8 +14,10 @@
 //!
 //! Identical `FlowConfig`s yield identical command streams on every platform.
 
+use std::collections::HashMap;
+
 use crate::rng::Rng;
-use crate::types::{Command, NewOrder, OrderId, Price, Qty, Side};
+use crate::types::{Command, Event, EventSink, NewOrder, OrderId, Price, Qty, Side};
 
 /// Percent weights of each message type. Must sum to 100.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,14 +43,14 @@ pub struct Mix {
 impl Default for Mix {
     fn default() -> Self {
         Self {
-            limit: 40,
+            limit: 44,
             post_only: 5,
-            cancel: 35,
+            cancel: 40,
             modify: 6,
-            aggressive_limit: 4,
-            ioc: 5,
-            market: 2,
-            fok: 3,
+            aggressive_limit: 1,
+            ioc: 2,
+            market: 1,
+            fok: 1,
         }
     }
 }
@@ -82,9 +84,9 @@ pub struct FlowConfig {
     pub max_depth_ticks: u64,
     /// Upper bound on order quantity (lots).
     pub max_qty: Qty,
-    /// Number of sent order ids remembered as cancel/modify targets. When the
-    /// window is full the generator cancels a remembered order before sending
-    /// anything new, which keeps the resting book bounded.
+    /// Target number of outstanding orders. Cancels become more likely as the
+    /// generator's live set approaches this size, and at the limit it cancels
+    /// before sending anything new, so the resting book stays bounded.
     pub live_window: usize,
     /// Message mix.
     pub mix: Mix,
@@ -118,8 +120,10 @@ pub struct FlowGenerator {
     rng: Rng,
     mid: Price,
     next_id: OrderId,
-    /// Ring of candidate targets for cancel/modify.
+    /// Candidate targets for cancel/modify.
     live: Vec<Sent>,
+    /// Position of each candidate in `live`, for O(1) [`forget`](Self::forget).
+    pos: HashMap<OrderId, usize>,
 }
 
 impl FlowGenerator {
@@ -135,6 +139,7 @@ impl FlowGenerator {
             mid: cfg.start_mid,
             next_id: 1,
             live: Vec::with_capacity(cfg.live_window),
+            pos: HashMap::with_capacity(cfg.live_window),
             cfg,
         }
     }
@@ -186,12 +191,65 @@ impl FlowGenerator {
     }
 
     fn remember(&mut self, o: &NewOrder) {
+        self.pos.insert(o.id, self.live.len());
         self.live.push(Sent { id: o.id, side: o.side, price: o.price, qty: o.qty });
     }
 
-    fn cancel_random(&mut self) -> Command {
-        let i = self.rng.below(self.live.len() as u64) as usize;
-        Command::Cancel { id: self.live.swap_remove(i).id }
+    fn take(&mut self, i: usize) -> Sent {
+        let sent = self.live.swap_remove(i);
+        self.pos.remove(&sent.id);
+        if let Some(moved) = self.live.get(i) {
+            self.pos.insert(moved.id, i);
+        }
+        sent
+    }
+
+    /// Stop targeting `id` with cancels and modifies, typically because the
+    /// order filled or was rejected. Unknown ids are ignored.
+    ///
+    /// Without feedback the generator runs open-loop and a sizeable share of
+    /// its cancels will race fills; see [`Feedback`].
+    pub fn forget(&mut self, id: OrderId) {
+        if let Some(&i) = self.pos.get(&id) {
+            self.take(i);
+        }
+    }
+
+    /// Re-centre the mid on an observed market price (e.g. the last trade).
+    pub fn anchor(&mut self, price: Price) {
+        self.mid = price;
+    }
+
+    /// Number of orders the generator currently believes are live.
+    pub fn outstanding(&self) -> usize {
+        self.live.len()
+    }
+
+    /// How badly a remembered quote is out of line with the current mid:
+    /// quotes on the wrong side of the mid score highest, then quotes far
+    /// behind the touch.
+    fn staleness(&self, s: &Sent) -> i64 {
+        let behind = match s.side {
+            Side::Buy => self.mid - s.price,
+            Side::Sell => s.price - self.mid,
+        };
+        if behind <= 0 {
+            i64::MAX
+        } else {
+            behind
+        }
+    }
+
+    /// Cancel the staler of two randomly sampled remembered orders. Market
+    /// makers pull quotes the mid has moved through or away from; picking
+    /// the worse of two random candidates biases toward those without
+    /// scanning the whole window.
+    fn cancel_stale(&mut self) -> Command {
+        let n = self.live.len() as u64;
+        let a = self.rng.below(n) as usize;
+        let b = self.rng.below(n) as usize;
+        let i = if self.staleness(&self.live[b]) > self.staleness(&self.live[a]) { b } else { a };
+        Command::Cancel { id: self.take(i).id }
     }
 
     fn passive(&mut self, post_only: bool) -> Command {
@@ -218,12 +276,12 @@ impl FlowGenerator {
 
     /// Produce the next command.
     pub fn next_command(&mut self) -> Command {
-        if self.rng.chance(1, 16) {
+        if self.rng.chance(1, 512) {
             self.mid += if self.rng.coin() { 1 } else { -1 };
         }
 
         if self.live.len() >= self.cfg.live_window {
-            return self.cancel_random();
+            return self.cancel_stale();
         }
 
         let m = self.cfg.mix;
@@ -242,10 +300,14 @@ impl FlowGenerator {
         } else if pick(m.post_only) {
             self.passive(true)
         } else if pick(m.cancel) {
-            if self.live.is_empty() {
+            // Cancel intensity scales with the number of outstanding orders
+            // (each order has a finite lifetime), so the book settles around
+            // `live_window` instead of being drained by a fixed cancel rate.
+            let n = self.live.len() as u64;
+            if n == 0 || !self.rng.chance(n, self.cfg.live_window as u64) {
                 return self.passive(false);
             }
-            self.cancel_random()
+            self.cancel_stale()
         } else if pick(m.modify) {
             if self.live.is_empty() {
                 return self.passive(false);
@@ -282,6 +344,50 @@ impl FlowGenerator {
     }
 }
 
+/// Event sink that collects ids of orders that are no longer live because
+/// they fully traded or were rejected, for feeding back to
+/// [`FlowGenerator::forget`]. Closing the loop like a real trading client
+/// that knows its own fills keeps cancels pointed at resting orders.
+#[derive(Debug, Default, Clone)]
+pub struct Feedback {
+    /// Ids reported done since the last drain.
+    pub done: Vec<OrderId>,
+    /// Price of the most recent trade since the last drain.
+    pub last_trade: Option<Price>,
+}
+
+impl EventSink for Feedback {
+    #[inline]
+    fn on_event(&mut self, event: Event) {
+        match event {
+            Event::Trade { taker, maker, maker_remaining, taker_remaining, price, .. } => {
+                self.last_trade = Some(price);
+                if maker_remaining == 0 {
+                    self.done.push(maker);
+                }
+                if taker_remaining == 0 {
+                    self.done.push(taker);
+                }
+            }
+            Event::Rejected { id, .. } => self.done.push(id),
+            _ => {}
+        }
+    }
+}
+
+impl Feedback {
+    /// Forward everything collected to `gen` and clear: finished ids are
+    /// forgotten and the generator's mid re-anchors on the last trade.
+    pub fn drain_into(&mut self, gen: &mut FlowGenerator) {
+        for id in self.done.drain(..) {
+            gen.forget(id);
+        }
+        if let Some(px) = self.last_trade.take() {
+            gen.anchor(px);
+        }
+    }
+}
+
 impl Iterator for FlowGenerator {
     type Item = Command;
 
@@ -308,23 +414,29 @@ mod tests {
 
     #[test]
     fn mix_is_respected_roughly() {
-        let n = 200_000;
-        let (mut new, mut cancel, mut modify, mut market) = (0, 0, 0, 0);
-        // Window large enough that forced cancels never kick in.
-        let cfg = FlowConfig { live_window: n, ..Default::default() };
-        for cmd in FlowGenerator::new(cfg).take(n) {
-            match cmd {
-                Command::New(o) if o.kind == OrderKind::Market => market += 1,
-                Command::New(_) => new += 1,
-                Command::Cancel { .. } => cancel += 1,
-                Command::Modify { .. } => modify += 1,
-            }
+        let n = 400_000;
+        let mut counts = [0usize; 6]; // new passive, cancel, modify, ioc, market, fok
+        for cmd in FlowGenerator::new(FlowConfig::default()).take(n) {
+            let k = match cmd {
+                Command::New(o) => match o.kind {
+                    OrderKind::ImmediateOrCancel => 3,
+                    OrderKind::Market => 4,
+                    OrderKind::FillOrKill => 5,
+                    _ => 0,
+                },
+                Command::Cancel { .. } => 1,
+                Command::Modify { .. } => 2,
+            };
+            counts[k] += 1;
         }
-        let pct = |x: usize| x * 100 / n;
-        assert!((33..=37).contains(&pct(cancel)), "cancel {}", pct(cancel));
-        assert!((5..=7).contains(&pct(modify)), "modify {}", pct(modify));
-        assert!((1..=3).contains(&pct(market)), "market {}", pct(market));
-        assert!(pct(new) > 50);
+        let pct = |k: usize| counts[k] as f64 * 100.0 / n as f64;
+        assert!((5.0..6.5).contains(&pct(2)), "modify {}", pct(2));
+        assert!((1.7..2.3).contains(&pct(3)), "ioc {}", pct(3));
+        assert!((0.8..1.2).contains(&pct(4)), "market {}", pct(4));
+        assert!((0.8..1.2).contains(&pct(5)), "fok {}", pct(5));
+        // Cancels are population-dependent; adds dominate while the book fills.
+        assert!((25.0..45.0).contains(&pct(1)), "cancel {}", pct(1));
+        assert!(pct(0) > pct(1));
     }
 
     #[test]
@@ -333,7 +445,24 @@ mod tests {
         let mut g = FlowGenerator::new(cfg);
         for _ in 0..10_000 {
             g.next_command();
-            assert!(g.live.len() <= 100);
+            assert!(g.outstanding() <= 100);
+        }
+    }
+
+    #[test]
+    fn feedback_removes_filled_and_rejected_orders() {
+        use crate::OrderBook;
+        let mut g = FlowGenerator::new(FlowConfig { live_window: 500, ..Default::default() });
+        let mut book = OrderBook::new();
+        let mut fb = Feedback::default();
+        for _ in 0..50_000 {
+            book.process(g.next_command(), &mut fb);
+            fb.drain_into(&mut g);
+        }
+        // Every order the generator still tracks must actually be resting.
+        for s in &g.live {
+            assert!(book.order(s.id).is_some(), "generator tracks dead order {}", s.id);
+            assert_eq!(g.pos[&s.id], g.live.iter().position(|x| x.id == s.id).unwrap());
         }
     }
 
