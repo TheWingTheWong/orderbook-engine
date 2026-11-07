@@ -1,5 +1,7 @@
 # orderbook-engine
 
+[![ci](https://github.com/TheWingTheWong/orderbook-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/TheWingTheWong/orderbook-engine/actions/workflows/ci.yml)
+
 A limit order book and matching engine for a single instrument, written in Rust.
 It does strict price-time priority matching on integer price ticks. The steady
 state allocates nothing, and the crate has no dependencies and no `unsafe`.
