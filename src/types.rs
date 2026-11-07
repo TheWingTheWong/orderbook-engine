@@ -16,6 +16,13 @@ pub type Qty = u64;
 /// Client-assigned order identifier. Must be unique among live orders.
 pub type OrderId = u64;
 
+/// Largest accepted order quantity.
+///
+/// Bounding a single order to 32 bits, together with the slab's 32-bit slot
+/// index, guarantees that per-level and per-side `u64` totals can never
+/// overflow: `(2^32 - 1) orders x (2^32 - 1) lots < 2^64`.
+pub const MAX_ORDER_QTY: Qty = u32::MAX as Qty;
+
 /// Side of an order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Side {
@@ -167,6 +174,8 @@ pub enum CancelReason {
 pub enum RejectReason {
     /// Quantity was zero.
     ZeroQuantity,
+    /// Quantity exceeded [`MAX_ORDER_QTY`].
+    QuantityTooLarge,
     /// An order with this id is already live.
     DuplicateOrderId,
     /// Cancel / modify referred to an order that is not on the book.

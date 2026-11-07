@@ -16,7 +16,11 @@ use orderbook_engine::*;
 fn adversarial_command(rng: &mut Rng) -> Command {
     let id = 1 + rng.below(48);
     let price = rng.range_i64(95, 105);
-    let qty = if rng.chance(1, 40) { 0 } else { 1 + rng.below(12) };
+    let qty = match rng.below(400) {
+        0..=9 => 0,
+        10 => MAX_ORDER_QTY + 1,
+        _ => 1 + rng.below(12),
+    };
     let side = if rng.coin() { Side::Buy } else { Side::Sell };
     match rng.below(20) {
         0..=6 => Command::New(NewOrder::limit(id, side, price, qty)),
@@ -104,8 +108,8 @@ fn every_event_kind_is_exercised() {
             });
         }
     }
-    // 5 accepted kinds + trade + booked + 4 cancel reasons + 2 modify + 4 reject reasons
-    assert_eq!(seen.len(), 17, "{seen:?}");
+    // 5 accepted kinds + trade + booked + 4 cancel reasons + 2 modify + 5 reject reasons
+    assert_eq!(seen.len(), 18, "{seen:?}");
 }
 
 #[test]

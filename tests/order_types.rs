@@ -574,3 +574,21 @@ fn identical_command_streams_produce_identical_events() {
     };
     assert_eq!(run(), run());
 }
+
+#[test]
+fn quantities_above_max_are_rejected_so_level_totals_cannot_overflow() {
+    let mut h = Harness::new();
+    let too_big = MAX_ORDER_QTY + 1;
+    assert_eq!(
+        h.new_order(NewOrder::limit(1, Buy, 100, too_big)),
+        vec![Event::Rejected { id: 1, reason: RejectReason::QuantityTooLarge }]
+    );
+    h.rest(&[(1, Buy, 100, MAX_ORDER_QTY), (2, Buy, 100, MAX_ORDER_QTY)]);
+    assert_eq!(h.book.volume_at(Buy, 100), 2 * MAX_ORDER_QTY);
+    assert_eq!(
+        h.modify(1, 100, too_big),
+        vec![Event::Rejected { id: 1, reason: RejectReason::QuantityTooLarge }]
+    );
+    let ev = h.new_order(NewOrder::market(3, Sell, MAX_ORDER_QTY));
+    assert_eq!(fills(&ev), vec![(1, 100, MAX_ORDER_QTY)]);
+}

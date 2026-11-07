@@ -83,6 +83,9 @@ impl ReferenceBook {
         if o.qty == 0 {
             return out.push(Event::Rejected { id: o.id, reason: RejectReason::ZeroQuantity });
         }
+        if o.qty > MAX_ORDER_QTY {
+            return out.push(Event::Rejected { id: o.id, reason: RejectReason::QuantityTooLarge });
+        }
         if self.find(o.id).is_some() {
             return out.push(Event::Rejected { id: o.id, reason: RejectReason::DuplicateOrderId });
         }
@@ -180,6 +183,9 @@ impl ReferenceBook {
         };
         if qty == 0 {
             return out.push(Event::Rejected { id, reason: RejectReason::ZeroQuantity });
+        }
+        if qty > MAX_ORDER_QTY {
+            return out.push(Event::Rejected { id, reason: RejectReason::QuantityTooLarge });
         }
         let o = self.orders[i];
         let keep = price == o.price && qty <= o.qty;

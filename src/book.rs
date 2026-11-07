@@ -107,6 +107,10 @@ impl OrderBook {
         if o.qty == 0 {
             return sink.on_event(Event::Rejected { id: o.id, reason: RejectReason::ZeroQuantity });
         }
+        if o.qty > MAX_ORDER_QTY {
+            return sink
+                .on_event(Event::Rejected { id: o.id, reason: RejectReason::QuantityTooLarge });
+        }
         if self.index.contains_key(&o.id) {
             return sink
                 .on_event(Event::Rejected { id: o.id, reason: RejectReason::DuplicateOrderId });
@@ -174,13 +178,17 @@ impl OrderBook {
     ///   order that now crosses the spread trades immediately as a taker,
     ///   unless it was entered post-only, in which case the modify is
     ///   rejected and the original order is left untouched.
-    /// * Quantity zero is rejected; use [`cancel`](Self::cancel).
+    /// * Quantity zero is rejected (use [`cancel`](Self::cancel)), as is a
+    ///   quantity above [`MAX_ORDER_QTY`].
     pub fn modify<S: EventSink>(&mut self, id: OrderId, price: Price, qty: Qty, sink: &mut S) {
         let Some(&idx) = self.index.get(&id) else {
             return sink.on_event(Event::Rejected { id, reason: RejectReason::UnknownOrder });
         };
         if qty == 0 {
             return sink.on_event(Event::Rejected { id, reason: RejectReason::ZeroQuantity });
+        }
+        if qty > MAX_ORDER_QTY {
+            return sink.on_event(Event::Rejected { id, reason: RejectReason::QuantityTooLarge });
         }
         let node = self.orders[idx];
 
