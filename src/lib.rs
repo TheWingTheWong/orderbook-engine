@@ -11,6 +11,7 @@
 //! * [`invariants`] — structural book checks and quantity-conservation ledger.
 //! * [`reference`] — naive O(n) book used as a differential-testing oracle.
 //! * [`rng`] / [`gen`] — deterministic PRNG and synthetic order-flow generator.
+//! * [`stats`] — fixed-memory latency histogram used by the replay tool.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms)]
@@ -23,6 +24,7 @@ pub mod level;
 pub mod reference;
 pub mod rng;
 pub mod slab;
+pub mod stats;
 pub mod types;
 
 pub use book::{OrderBook, RestingOrder};
