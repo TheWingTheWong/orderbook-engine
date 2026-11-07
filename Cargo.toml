@@ -20,3 +20,9 @@ debug = false
 
 [profile.bench]
 inherits = "release"
+
+# The differential and invariant tests replay hundreds of thousands of
+# commands through an O(n) reference book; opt-level 1 keeps them fast while
+# preserving debug assertions and overflow checks.
+[profile.test]
+opt-level = 1
