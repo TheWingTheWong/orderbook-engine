@@ -7,14 +7,17 @@
 //! * [`slab`] — free-list object pool backing resting orders.
 //! * [`level`] — intrusive FIFO queue of orders at one price.
 //! * [`book`] — the [`OrderBook`] and its matching logic.
+//! * [`depth`] — top of book and L2 depth snapshots.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms)]
 
 pub mod book;
+pub mod depth;
 pub mod level;
 pub mod slab;
 pub mod types;
 
 pub use book::{OrderBook, RestingOrder};
+pub use depth::{Depth, LevelSummary, TopOfBook};
 pub use types::*;
