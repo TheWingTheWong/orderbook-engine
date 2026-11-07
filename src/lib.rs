@@ -16,5 +16,5 @@ pub mod level;
 pub mod slab;
 pub mod types;
 
-pub use book::OrderBook;
+pub use book::{OrderBook, RestingOrder};
 pub use types::*;

@@ -25,6 +25,19 @@ use crate::level::{Level, OrderNode};
 use crate::slab::{Slab, SlotId, NIL};
 use crate::types::*;
 
+/// Snapshot of a resting order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestingOrder {
+    /// Order id.
+    pub id: OrderId,
+    /// Side.
+    pub side: Side,
+    /// Price level.
+    pub price: Price,
+    /// Open quantity.
+    pub qty: Qty,
+}
+
 /// A single-instrument limit order book with price-time priority matching.
 #[derive(Debug, Clone, Default)]
 pub struct OrderBook {
@@ -72,6 +85,21 @@ impl OrderBook {
     #[inline]
     pub fn best_ask(&self) -> Option<Price> {
         self.asks.keys().next().copied()
+    }
+
+    /// Look up a resting order.
+    pub fn order(&self, id: OrderId) -> Option<RestingOrder> {
+        let node = &self.orders[*self.index.get(&id)?];
+        Some(RestingOrder { id, side: node.side, price: node.price, qty: node.qty })
+    }
+
+    /// Apply one command, reporting results to `sink`.
+    pub fn process<S: EventSink>(&mut self, cmd: Command, sink: &mut S) {
+        match cmd {
+            Command::New(o) => self.submit(o, sink),
+            Command::Cancel { id } => self.cancel(id, sink),
+            Command::Modify { id, price, qty } => self.modify(id, price, qty, sink),
+        }
     }
 
     /// Enter a new order.
@@ -125,6 +153,97 @@ impl OrderBook {
             }),
             OrderKind::FillOrKill => unreachable!("FOK liquidity was pre-checked"),
         }
+    }
+
+    /// Cancel a resting order. O(1) to locate and unlink; removing a level
+    /// that became empty costs one B-tree deletion.
+    pub fn cancel<S: EventSink>(&mut self, id: OrderId, sink: &mut S) {
+        let Some(idx) = self.index.remove(&id) else {
+            return sink.on_event(Event::Rejected { id, reason: RejectReason::UnknownOrder });
+        };
+        let node = self.unlink_resting(idx);
+        sink.on_event(Event::Cancelled { id, remaining: node.qty, reason: CancelReason::User });
+    }
+
+    /// Change the price and/or open quantity of a resting order.
+    ///
+    /// * Same price, quantity reduced (or unchanged): amended in place, keeps
+    ///   its queue position.
+    /// * Price changed or quantity increased: the order is pulled and
+    ///   re-entered as if new (same id), losing time priority. A re-priced
+    ///   order that now crosses the spread trades immediately as a taker,
+    ///   unless it was entered post-only, in which case the modify is
+    ///   rejected and the original order is left untouched.
+    /// * Quantity zero is rejected; use [`cancel`](Self::cancel).
+    pub fn modify<S: EventSink>(&mut self, id: OrderId, price: Price, qty: Qty, sink: &mut S) {
+        let Some(&idx) = self.index.get(&id) else {
+            return sink.on_event(Event::Rejected { id, reason: RejectReason::UnknownOrder });
+        };
+        if qty == 0 {
+            return sink.on_event(Event::Rejected { id, reason: RejectReason::ZeroQuantity });
+        }
+        let node = self.orders[idx];
+
+        if price == node.price && qty <= node.qty {
+            let level = self.side_mut(node.side).get_mut(&node.price).expect("level of live order");
+            level.total_qty -= node.qty - qty;
+            self.orders[idx].qty = qty;
+            return sink.on_event(Event::Modified {
+                id,
+                old_price: node.price,
+                old_qty: node.qty,
+                new_price: price,
+                new_qty: qty,
+                priority_kept: true,
+            });
+        }
+
+        if node.post_only && self.would_cross(node.side, price) {
+            return sink.on_event(Event::Rejected { id, reason: RejectReason::PostOnlyWouldCross });
+        }
+
+        self.index.remove(&id);
+        self.unlink_resting(idx);
+        sink.on_event(Event::Modified {
+            id,
+            old_price: node.price,
+            old_qty: node.qty,
+            new_price: price,
+            new_qty: qty,
+            priority_kept: false,
+        });
+        let remaining = self.match_incoming(id, node.side, price, qty, sink);
+        if remaining > 0 {
+            self.rest(id, node.side, price, remaining, node.post_only, sink);
+        }
+    }
+
+    #[inline]
+    fn side_mut(&mut self, side: Side) -> &mut BTreeMap<Price, Level> {
+        match side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        }
+    }
+
+    /// Detach the order in slot `idx` from its level, drop the level if it
+    /// became empty, and free the slot. The caller owns the index entry.
+    fn unlink_resting(&mut self, idx: SlotId) -> OrderNode {
+        let OrderNode { side, price, .. } = self.orders[idx];
+        let book = match side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        if let Entry::Occupied(mut e) = book.entry(price) {
+            let level = e.get_mut();
+            level.unlink(&mut self.orders, idx);
+            if level.is_empty() {
+                e.remove();
+            }
+        } else {
+            unreachable!("resting order {} has no level at {price}", self.orders[idx].id);
+        }
+        self.orders.remove(idx)
     }
 
     /// Whether a resting order at `price` on `side` would immediately trade.
@@ -279,6 +398,42 @@ mod tests {
         assert_eq!(ev, vec![Event::Rejected { id: 2, reason: RejectReason::PostOnlyWouldCross }]);
         let ev = run(&mut b, NewOrder::post_only(3, Side::Buy, 99, 5));
         assert!(matches!(ev[1], Event::Booked { id: 3, price: 99, .. }));
+    }
+
+    #[test]
+    fn cancel_removes_order_and_empty_level() {
+        let mut b = OrderBook::new();
+        run(&mut b, NewOrder::limit(1, Side::Buy, 99, 5));
+        let mut ev = Vec::new();
+        b.cancel(1, &mut ev);
+        b.cancel(1, &mut ev);
+        assert_eq!(
+            ev,
+            vec![
+                Event::Cancelled { id: 1, remaining: 5, reason: CancelReason::User },
+                Event::Rejected { id: 1, reason: RejectReason::UnknownOrder },
+            ]
+        );
+        assert!(b.is_empty() && b.bids.is_empty());
+    }
+
+    #[test]
+    fn modify_size_down_keeps_priority_size_up_loses_it() {
+        let mut b = OrderBook::new();
+        run(&mut b, NewOrder::limit(1, Side::Sell, 100, 5));
+        run(&mut b, NewOrder::limit(2, Side::Sell, 100, 5));
+        let mut ev = Vec::new();
+        b.modify(1, 100, 3, &mut ev);
+        assert!(matches!(ev[0], Event::Modified { priority_kept: true, .. }));
+        let ev = run(&mut b, NewOrder::ioc(3, Side::Buy, 100, 1));
+        assert!(matches!(ev[1], Event::Trade { maker: 1, .. }));
+
+        let mut ev = Vec::new();
+        b.modify(1, 100, 9, &mut ev);
+        assert!(matches!(ev[0], Event::Modified { priority_kept: false, .. }));
+        let ev = run(&mut b, NewOrder::ioc(4, Side::Buy, 100, 1));
+        assert!(matches!(ev[1], Event::Trade { maker: 2, .. }));
+        assert_eq!(b.order(1).map(|o| o.qty), Some(9));
     }
 
     #[test]
