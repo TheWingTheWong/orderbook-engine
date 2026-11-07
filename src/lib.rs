@@ -4,10 +4,12 @@
 //! price-time priority, integer price ticks and allocation-free steady state.
 //!
 //! * [`types`] — prices, quantities, order requests, commands and events.
+//! * [`slab`] — free-list object pool backing resting orders.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms)]
 
+pub mod slab;
 pub mod types;
 
 pub use types::*;
